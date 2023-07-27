@@ -1,4 +1,4 @@
-# from __future__ import annotations
+from __future__ import annotations
 import numpy as np
 import lmfit
 import toml
@@ -6,7 +6,12 @@ import pathlib
 import re
 from collections import defaultdict
 from itertools import product
-from typing import Callable, Optional, Self
+from typing import Callable, Optional
+try:
+    from typing import Self
+except ImportError:
+    from typing import TypeVar
+    Self = TypeVar("Self")
 
 def opt_or(x, default):
     return x if x is not None else default
@@ -24,8 +29,10 @@ def value_str(
     latex: bool=False,
     dec: Optional[int]=None,
 ) -> str:
-    ord_x = np.floor(np.log10(x))
-    ord_err = np.floor(np.log10(err)) if np.isfinite(err) else None
+    ord_x = np.floor(np.log10(abs(x)))
+    ord_err = (
+        np.floor(np.log10(err)) if np.isfinite(err) and err > 1e-12 else None
+    )
     if sci:
         xp = (
             round(x / 10**opt_or(ord_err, 0))
@@ -139,7 +146,7 @@ class ExpVal:
 
     def __init__(self, val: float, err: float):
         self.val = val
-        self.err = abs(err)
+        self.err = abs(err) if err is not None else np.nan
 
     def __eq__(self, rhs: Self | float | int) -> bool:
         other = ExpVal.from_num_or(rhs)
