@@ -264,3 +264,34 @@ def _rgb2hex(rgb: tuple[int, int, int]) -> str:
 def nm2hex(wavelength: float) -> str:
     return _rgb2hex(nm2rgb(wavelength))
 
+def beam_rayleigh(
+    wavelength: float,
+    waist_radius: float,
+    refr_index: float=1.0,
+) -> float:
+    return np.pi * waist_radius**2 * refr_index / wavelength
+
+def beam_radius(
+    z: float,
+    wavelength: float,
+    waist_radius: float,
+    refr_index: float=1.0,
+) -> float:
+    zR = beam_rayleigh(wavelength, waist_radius, refr_index)
+    return waist_radius * np.sqrt(1 + (z / zR)**2)
+
+def beam_peak_intensity(radius: float, power: float) -> float:
+    return 2 * power / (np.pi * radius**2)
+
+def beam_power(radius: float, peak_intensity: float) -> float:
+    return np.pi * radius**2 * peak_intensity / 2
+
+def rabi_saturation(linewidth: float, rabi_freq: float) -> float:
+    return (rabi_freq / linewidth)**2 * 2
+
+def saturation_rabi(linewidth: float, saturation: float) -> float:
+    return np.sqrt(saturation / 2) * linewidth
+
+def saturation_intensity(wavelength: float, linewidth: float) -> float:
+    return np.pi / 3 * h * c / wavelength**3 * linewidth
+
