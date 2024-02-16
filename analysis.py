@@ -1,24 +1,21 @@
 from __future__ import annotations
-import numpy as np
-import lmfit
-import toml
+from collections import defaultdict
+from dataclasses import dataclass
+from itertools import product
 import pathlib
 import re
-from collections import defaultdict
-from itertools import product
 from typing import Callable, Optional
 try:
     from typing import Self
 except ImportError:
     from typing import TypeVar
     Self = TypeVar("Self")
+import lmfit
+import numpy as np
+import toml
 
 def opt_or(x, default):
     return x if x is not None else default
-
-def qq(X):
-    print(X)
-    return X
 
 def value_str(
     x: float,
@@ -610,13 +607,13 @@ def residuals(
     model: Callable[[lmfit.Parameters, np.ndarray, ...], np.ndarray],
     *indep: np.ndarray,
     data: np.ndarray,
-    err: np.ndarray
+    err: Optional[np.ndarray],
 ) -> np.ndarray:
     m = model(params, *indep)
-    return ((data - m) / err)**2
-
-def struct(name: str=None, **fields):
-    return type("Struct" if name is None else name, (), fields)()
+    if err is None:
+        return (data - m)**2
+    else:
+        return ((data - m) / err)**2
 
 def gen_xplot(xmin: float, xmax: float, N: int=1000, k: float=0.1):
     xmid = (xmin + xmax) / 2
@@ -635,42 +632,11 @@ def gen_imshow_extent(x: np.ndarray, y: np.ndarray, lower=True) \
         ][::+1 if lower else -1]
     ]
 
-def gen_params(names: list[str], init_vals: dict[str, float]=None,
-        default_vals: dict[str, float]=None,
-        param_bounds: dict[str, (float | None, float | None)]=None,
-        default_bounds: dict[str, (float | None, float | None)]=None) \
-    -> lmfit.Parameters:
-    init_vals = dict() if init_vals is None else init_vals
-    default_vals = dict() if default_vals is None else default_vals
-    param_bounds = dict() if param_bounds is None else param_bounds
-    default_bounds = dict() if default_bounds is None else default_bounds
-    params = lmfit.Parameters()
-    for v in names:
-        val = init_vals.get(v, default_vals.get(v, 0.0))
-        bounds = param_bounds.get(v, default_bounds.get(v, (None, None)))
-        params.add(v, value=val, min=bounds[0], max=bounds[1])
-    return params
-
 def get_paramvals(
     params: lmfit.Parameters,
     *param_names: str
 ) -> list[tuple[float, float]]:
     return [(params[name].value, params[name].stderr) for name in param_names]
-
-def gen_paramstr(
-    params: lmfit.Parameters,
-    param_names: dict[str, str],
-    model: str = None,
-) -> str:
-    return (
-        (f"${model}$\n" if model is not None else "")
-        + "\n".join(
-            f"${symbol}"
-            f" = {params[name].value:.5f}"
-            f" \\pm {params[name].stderr if params[name].stderr is not None else -1.0:.5f}$"
-            for symbol, name in param_names.items()
-        )
-    )
 
 def dict_get_path(D: dict, path: list[...], default=None):
     """
@@ -841,745 +807,278 @@ def load_results(
 
     return X, Y, err
 
-class Fitter:
-    def __init__(self, x: np.ndarray, y: np.ndarray, err: np.ndarray=None):
-        self.data = struct("Data",
-            x=x, y=y, err=np.ones(x.shape) if err is None else err)
-        self.fit = None
+@dataclass
+class Param:
+    """
+    Settings for a parameter passed to an `lmfit` model.
 
-    def clone(self) -> Self:
-        return Fitter(self.data.x, self.data.y, self.data.err)
+    Fields
+    ------
+    value : float
+        Initial value for the Levenberg-Marquardt algorithm.
+    min : float = -numpy.inf
+        Lower bound constraint for the parameter.
+    max : float = +numpy.inf
+        Upper bound constraint for the parameter.
+    vary : bool = True
+        Allow this parameter to vary while fitting.
+    expr : Optional[str] = None
+        Analytical expression to constrain the parameter to the values of other
+        parameters.
+    brute_step : Optional[float] = None
+    """
+    value: float
+    min: float = -np.inf
+    max: float = +np.inf
+    vary: bool = True
+    expr: str = None
+    brute_step: float = None
 
-    @staticmethod
-    def load_results(infile: pathlib.Path, label_pat: str, data_path: list[str],
-            indep_group: int,
-            group_filters: dict[int, type(lambda: bool)]=None,
-            skip_non_match: bool=True, print_skipped: bool=True):
-        [x], y, err = load_results(
-            infile, label_pat, data_path, (indep_group,), group_filters,
-            skip_non_match, print_skipped)
-        return Fitter(x, y, err)
+class ModelBase:
+    """
+    Abstract type for a model function to fit to.
 
-    def as_model(self, param_names: list[str],
-            model: Callable[[lmfit.Parameters, np.ndarray], np.ndarray],
-            derivs: tuple[Callable, Callable]=None,
-            init_params: dict[str, float]=None,
-            param_bounds: dict[str, (float | None, float | None)]=None,
-            overwrite: bool=False):
-        assert self.fit is None or overwrite, "Data has aleady been fit"
-        assert all(isinstance(x, str) for x in param_names)
+    Fields
+    ------
+    MODELSTR : str
+        Description of the functional form of the model.
+    PARAMS : set[str]
+        Set of parameters required to evaluate the model at a point in
+        parameter space.
+    """
+    MODELSTR: str
+    PARAMS: set[str]
 
-        params = gen_params(
-            param_names, init_params, dict(), param_bounds, dict())
-        fit = lmfit.minimize(
-            residuals,
-            params,
-            args=(model, self.data.x),
-            kws={"data": self.data.y, "err": self.data.err},
-        )
-        if not fit.success:
-            raise Exception
+    def __init__(self):
+        pass
 
-        params0: fit.params
-        xplot = gen_xplot(self.data.x.min(), self.data.x.max())
-        yplot = model(params0, xplot)
+    def f(self, params: lmfit.Parameters, x: np.ndarray) -> np.ndarray:
+        """
+        Model evaluator.
+        """
+        raise NotImplementedError()
 
-        self.fit = struct("Fit",
-            params=params_names,
-            **{v: (fit.params[v].value, fit.params[v].stderr)
-                for v in param_names},
-            covar=fit.covar if hasattr(fit, "covar") else None,
-            f0=lambda x: model(params0, x),
-            f1=(lambda x: derivs[0](params0, x))
-                if isinstance(derivs, tuple) and len(derivs) > 0 else None,
-            f2=(lambda x: derivs[1](params0, x))
-                if isinstance(derivs, tuple) and len(derivs) > 1 else None,
-            xplot=xplot,
-            yplot=yplot,
-        )
-        return self
+ModelFn = Callable[[lmfit.Parameters, np.ndarray], np.ndarray]
+CostFn = Callable[[lmfit.Parameters, ModelFn, ...], np.ndarray]
 
-    def as_polynomial(self, deg: int=1, init_params: dict[str, float]=None,
-            param_bounds: dict[str, (float | None, float | None)]=None,
-            overwrite: bool=False):
-        assert self.fit is None or overwrite, "Data has already been fit"
-        assert deg >= 0
-        varnames = [f"a{k}" for k in range(deg + 1)]
+class Fit1D:
+    """
+    Simple driver class for the `lmfit.minimizer` model-fitting process.
 
-        def model(params: lmfit.Parameters, x: np.ndarray):
-            a = [params[v].value for v in varnames]
-            return sum(a[k] * x**k for k in range(deg + 1))
+    Fields
+    ------
+    model : ModelBase
+        Fit to this model. See `help(ModelBase)` for more info.
+    init_params : lmfit.Parameters
+        lmfit record of initial parameter values.
+    fit_result : lmfit.minimizer.MinimizerResult
+        Output of the `lmfit.minimizer` call.
+    """
+    model: ModelBase
+    init_params: lmfit.Parameters
+    fit_result: lmfit.minimizer.MinimizerResult
 
-        params = gen_params(
-            varnames,
-            init_params,
-            {"a0": self.data.y.mean()},
-            param_bounds,
-        )
-        fit = lmfit.minimize(
-            residuals,
-            params,
-            args=(model, self.data.x),
-            kws={"data": self.data.y, "err": self.data.err},
-        )
-        if not fit.success:
-            raise Exception
+    def __init__(self, model: ModelBase, init_params: dict[str, Param]):
+        """
+        Construct a new model-fitting driver.
 
-        params0 = fit.params
-        xplot = gen_xplot(self.data.x.min(), self.data.x.max())
-        yplot = model(params0, xplot)
-
-        self.fit = struct("Fit",
-            params=varnames,
-            **{v: (fit.params[v].value, fit.params[v].stderr)
-                for v in varnames},
-            covar=fit.covar if hasattr(fit, "covar") else None,
-            deg=deg,
-            f0=lambda x: sum(
-                fit.params[f"a{k}"].value * x**k
-                for k in range(deg + 1)
-            ),
-            f1=lambda x: sum(
-                k * fit.params[f"a{k}"].value * x**(k - 1)
-                for k in range(1, deg + 1)
-            ),
-            f2=lambda x: sum(
-                k * (k - 1) * fit.params[f"a{k}"].value * x**(k - 2)
-                for k in range(2, deg + 1)
-            ),
-            xplot=xplot,
-            yplot=yplot,
-        )
-        return self
-
-    def as_exponential(self, decay: bool=True, rate: bool=False,
-            fix_first: bool=False, init_params: dict[str, float]=None,
-            param_bounds: dict[str, (float | None, float | None)]=None,
-            overwrite: bool=False):
-        assert self.fit is None or overwrite, "Data has already been fit"
-        varnames = ["A", "y", "B"]
-        z = -1 if decay else +1
-
-        def model(params: lmfit.Parameters, x: np.ndarray):
-            A = params["A"].value
-            y = params["y"].value
-            B = params["B"].value
-            return A * np.exp(z * x * (y if rate else 1 / y)) + B
-
-        if fix_first:
-            params = gen_params(
-                varnames[:-1],
-                init_params,
-                {
-                    "A": self.data.y[0],
-                    "y": 0.0 if rate else 0.1,
-                },
-                param_bounds,
-                {"y": (0.0, None)},
+        Parameters
+        ----------
+        model : ModelBase
+            Fit to this model. See `help(ModelBase)` for more info.
+        init_params : dict[str, Param]
+            Dictionary mapping parameter names to initial settings. The
+            parameter names contained here are checked against those declared
+            by the model.
+        """
+        self.model = model
+        model_keys = set(self.model.PARAMS)
+        missing_keys = {k for k in params.keys() if k not in model_keys}
+        if len(missing_keys) > 0:
+            raise ValueError(f"missing keys: {missing_keys}")
+        self.params = lmfit.Parameters()
+        for (name, settings) in params.items():
+            self.params.add(
+                name,
+                value=settings.value,
+                min=settings.min,
+                max=settings.max,
+                vary=settings.vary,
+                expr=settings.expr,
+                brute_step=settings.brute_step,
             )
-            params.add("A0", value=self.data.y[0], vary=False)
-            params.add("x0", value=self.data.x[0], vary=False)
-            params.add("B",
-                expr=f"A0 - A * exp({z:.0f} {'*' if rate else '/'} * y * x0)")
+        self.fit_result = None
+
+    def set_model(self, model: ModelBase):
+        """
+        Set a new model to fit to.
+
+        Returns `self` afterward.
+        """
+        self.model = model
+        return self
+
+    def set_params(self, params: dict[str, Param]):
+        """
+        Set new initial parameters.
+
+        Returns `self` afterward.
+        """
+        for (name, settings) in params.items():
+            self.params.add(
+                name,
+                value=settings.value,
+                min=settings.min,
+                max=settings.max,
+                vary=settings.vary,
+                expr=settings.expr,
+                brute_step=settings.brute_step,
+            )
+        return self
+
+    def get_init_params(self) -> lmfit.Parameters:
+        """
+        Get an `lmfit` record of the initial parameters.
+
+        This is equivalent to direct access of the `init_params` field.
+        """
+        return self.init_params
+
+    def do_fit(
+        self,
+        costf: CostFn,
+        costf_args: tuple[...],
+        *minimizer_args,
+        **minimizer_kwargs,
+    ):
+        """
+        Perform the Levenberg-Marquardt fit. Raises `lmfit.MinimizerException`
+        if the fit is unseccessful.
+
+        Returns `self` afterward.
+
+        Parameters
+        ----------
+        costf : CostFn
+            Cost function to pass to the lmfit routine. This function must have
+            the signature
+                costf(lmfit.Parameters, ModelFn, ...) -> numpy.ndarray
+            where ModelFn is a function with the signature
+                model_fn(lmfit.Parameters, numpy.ndarray) -> numpy.ndarray
+        costf_args : tuple[...]
+            Tuple of extra arguments to pass to the cost function.
+        *minimizer_args : ...
+            Extra positional arguments to pass to `lmfit.minimize`.
+        **minimizer_kwargs : ...
+            Extra keyword arguments to pass to `lmfit.minimze`.
+        """
+        fit_result = lmfit.minimize(
+            costf,
+            self.init_params,
+            args=(self.model.f, *costf_args),
+            *args,
+            **kwargs,
+        )
+        if not fit_result.success:
+            raise lmfit.MinimizerException("fit failed")
+        self.fit_result = fit_result
+        return self
+
+    def is_fit(self) -> bool:
+        """
+        Return `True` if a successful fit has been performed.
+        """
+        return self.fit_result is not None
+
+    def get_fit_result(self) -> Optional[lmfit.minimizer.MinimizerResult]:
+        """
+        Get the bare `lmfit.minimizer.MinimizerResult` returned by
+        `lmfit.minimize` if a successful fit has been performed.
+
+        This is equivalent to direct access of the `fit_result` field.
+        """
+        return self.fit_result
+
+    def get_result_param(self, key: str) -> ExpVal:
+        """
+        Get the value and standard error of a single fit parameter as an
+        `ExpVal`.
+
+        See `help(libscratch.analysis.ExpVal)` for more info.
+
+        Raises `RuntimeError` if a successful fit has not been performed, or
+        `ValueError` if `key` is not a valid parameter name for the model.
+        """
+        if self.fit_result is None:
+            raise RuntimeError("model has not been fit")
+        elif key not in self.model.PARAMS:
+            raise ValueError(f"invalid key {key}")
         else:
-            params = gen_params(
-                varnames,
-                init_params,
-                {
-                    "A": self.data.y.max() - self.data.y.min(),
-                    "y": 0.0 if rate else 0.1,
-                    "B": self.data.y.min(),
-                },
-                param_bounds,
+            return ExpVal(
+                self.fit_result.params[key].value,
+                self.fit_result.params[key].stderr,
             )
-        fit = lmfit.minimize(
-            residuals,
-            params,
-            args=(model, self.data.x),
-            kws={"data": self.data.y, "err": self.data.err},
-        )
-        if not fit.success:
-            raise Exception
 
-        params0 = fit.params
-        A = params0["A"].value
-        y = params0["y"].value
-        B = params0["B"].value
-        xplot = gen_xplot(self.data.x.min(), self.data.x.max())
-        yplot = model(params0, xplot)
+    def get_result_params(self) -> dict[str, ExpVal]:
+        """
+        Get the values and standard errors of all fit parameters as `ExpVal`s.
 
-        self.fit = struct("Fit",
-            params=varnames,
-            **{v: (fit.params[v].value, fit.params[v].stderr)
-                for v in varnames},
-            covar=fit.covar if hasattr(fit, "covar") else None,
-            decay=decay,
-            fix_first=fix_first,
-            f0=lambda x: A * np.exp(z * y * z) + B,
-            f1=lambda x: A * (z * y) * np.exp(z * y * x),
-            f2=lambda x: A * y**2 * np.exp(z * y * x),
-            xplot=xplot,
-            yplot=yplot,
-        )
-        return self
+        See `help(libscratch.analysis.ExpVal)` for more info.
 
-    def as_gaussian(self, stdev_s: bool=False, fix_max: bool=False,
-            init_params: dict[str, float]=None,
-            param_bounds: dict[str, (float | None, float | None)]=None,
-            overwrite: bool=False):
-        assert self.fit is None or overwrite, "Data has already been fit"
-        varnames = ["A", "u", "s", "B"]
-        z = 2 if stdev_s else 1
+        Raises `RuntimeError` if a successful fit has not been performed.
+        """
+        return {key: self.get_result_param(key) for key in self.model.PARAMS}
 
-        def model(params: lmfit.Parameters, x: np.ndarray):
-            A = params["A"].value
-            u = params["u"].value
-            s = params["s"].value
-            B = params["B"].value
-            return A * np.exp(-(x - u)**2 / (z * s**2)) + B
+    def gen_paramstr(
+        self,
+        comment: Optional[str]=None,
+        units: Optional[dict[str, str]]=None,
+        with_modelstr: bool=True,
+        latex_math: bool=True,
+    ) -> str:
+        """
+        Generate a single multiline string giving information on the model
+        function and its fit parameter values.
 
-        if fix_max:
-            params = gen_params(
-                ["A", "s"],
-                init_params,
-                {
-                    "A": self.data.y.max(),
-                    "s": self.data.x.std(),
-                },
-                param_bounds,
-                {"s": (0.0, None)},
+        Raises `RuntimeError` if a successful fit has not been performed.
+
+        Parameters
+        ----------
+        comment : Optional[str] = None
+            Optional notes to attach to the end of the string.
+        units : Optional[dict[str, str]] = None
+            Optional units to attach to all parameters.
+        with_modelstr : bool = True
+            Include a string representation of the model function.
+        latex_math : bool = True
+            Wrap parameters in '$' for latex math rendering.
+        """
+        if self.fit_result is None:
+            raise RuntimeError("model has not been fit")
+        units = dict() if units is None else units
+        rp = self.get_result_params()
+        m = lambda s: ("$" + s + "$") if latex_math else s
+        return (
+            (m(self.model.MODELSTR + "\n") if comment is not None else "")
+            + "\n".join(
+                (
+                    f"{m(name)} = {param.value_str(latex=latex_math)}"
+                    if param.err is not None
+                    else f"{m(name)} = {f'{param.err:.5f}'}(nan)"
+                ) + " " + units.get(name, "")
+                for (name, param) in rp
             )
-            params.add("A0", value=self.data.y.max(), vary=False)
-            params.add("u", value=self.data.x[self.data.y.argmax()], vary=False)
-            params.add("B", expr="A0 - A")
+            + ((comment + "\n") if comment is not None else "")
+        )
+
+    def gen_fit_curve(self, x: np.ndarray) -> np.ndarray:
+        """
+        Sample the resulting fit curve.
+
+        Raises `RuntimeError` if a successful fit has not been performed.
+        """
+        if self.fit_result is None:
+            raise RuntimeError("model has not been fit")
         else:
-            params = gen_params(
-                varnames,
-                init_params,
-                {
-                    "A": self.data.y.max(),
-                    "u": self.data.x[self.data.y.argmax()],
-                    "s": self.data.x.std(),
-                    "B": self.data.y.min(),
-                },
-                param_bounds,
-            )
-        fit = lmfit.minimize(
-            residuals,
-            params,
-            args=(model, self.data.x),
-            kws={"data": self.data.y, "err": self.data.err},
-        )
-        if not fit.success:
-            raise Exception
-
-        params0 = fit.params
-        A = params0["A"].value
-        u = params0["u"].value
-        s = params0["s"].value
-        B = params0["B"].value
-        xplot = gen_xplot(self.data.x.min(), self.data.x.max())
-        yplot = model(params0, xplot)
-
-        self.fit = struct("Fit",
-            params=varnames,
-            **{v: (fit.params[v].value, fit.params[v].stderr)
-                for v in varnames},
-            covar=fit.covar if hasattr(fit, "covar") else None,
-            stdev_s=stdev_s,
-            fix_max=fix_max,
-            f0=lambda x: A * np.exp(-(x - u)**2 / (z * s**2)) + B,
-            f1=lambda x: (
-                2 * A * (u - x) / (z * s**2) * np.exp(-(x - u)**2 / (z * s**2))
-            ),
-            f2=lambda x: (
-                2 * A * (2 * (x - u)**2 / (z * s**2) - 1) / (z * s**2)
-                * np.exp(-(x - u)**2 / (z * s**2))
-            ),
-            xplot=xplot,
-            yplot=yplot,
-        )
-        return self
-
-    def as_lorentzian(self, fix_max: bool=False,
-            init_params: dict[str, float]=None,
-            param_bounds: dict[str, (float | None, float | None)]=None,
-            overwrite: bool=False):
-        assert self.fit is None or overwrite, "Data has already been fit"
-        varnames = ["A", "u", "s", "B"]
-
-        def model(params: lmfit.Parameters, x: np.ndarray):
-            A = params["A"].value
-            u = params["u"].value
-            s = params["s"].value
-            B = params["B"].value
-            return A / (1 + ((x - u) / s)**2) + B
-
-        if fix_max:
-            params = gen_params(
-                ["A", "s"],
-                init_params,
-                {
-                    "A": self.data.y.max(),
-                    "s": self.data.x.std(),
-                },
-                param_bounds,
-                {"s": (0.0, None)},
-            )
-            params.add("A0", value=self.data.y.max(), vary=False)
-            params.add("u", value=self.data.x[self.data.y.argmax()], vary=False)
-            params.add("B", expr="A0 - A")
-        else:
-            params = gen_params(
-                varnames,
-                init_params,
-                {
-                    "A": self.data.y.max(),
-                    "u": self.data.x[self.data.y.argmax()],
-                    "s": self.data.x.std(),
-                    "B": self.data.y.min(),
-                },
-                param_bounds,
-            )
-        fit = lmfit.minimize(
-            residuals,
-            params,
-            args=(model, self.data.x),
-            kws={"data": self.data.y, "err": self.data.err},
-        )
-        if not fit.success:
-            raise Exception
-
-        params0 = fit.params
-        A = params0["A"].value
-        u = params0["u"].value
-        s = params0["s"].value
-        B = params0["B"].value
-        xplot = gen_xplot(self.data.x.min(), self.data.x.max())
-        yplot = model(params0, xplot)
-
-        self.fit = struct("Fit",
-            params=varnames,
-            **{v: (fit.params[v].value, fit.params[v].stderr)
-                for v in varnames},
-            covar=fit.covar if hasattr(fit, "covar") else None,
-            fix_max=fix_max,
-            f0=lambda x: A / (1 + ((x - u) / s)**2),
-            f1=lambda x: (
-                2 * A * (u - x) / (1 + ((x - u) / s)**2) / s**2
-            ),
-            f2=lambda x: (
-                2 * A * s**2 * (3 * (x - u)**2 - s**2)
-                / (s**2 + (x - u)**2)**3
-            ),
-            xplot=xplot,
-            yplot=yplot,
-        )
-        return self
-
-    def as_oscillatory(self, decay: bool=True,
-            init_params: dict[str, float]=None,
-            param_bounds: dict[str, (float | None, float | None)]=None,
-            overwrite: bool=False):
-        assert self.fit is None or overwrite, "Data has already been fit"
-        varnames = ["A", "y", "w", "d", "B"]
-        z = -1 if decay else +1
-
-        def model(params: lmfit.Parameters, x: np.ndarray):
-            A = params["A"].value
-            y = params["y"].value
-            w = params["w"].value
-            d = params["d"].value
-            B = params["B"].value
-            return A * np.exp(z * y * x) * np.cos(w * x + d) + B
-
-        params = gen_params(
-            varnames,
-            init_params,
-            {
-                "A": self.data.y.max() - self.data.t.mean(),
-                "B": self.data.y.mean(),
-            },
-            param_bounds,
-            {
-                "y": (0.0, None),
-                "w": (0.0, None),
-                "d": (0.0, 2.0 * np.pi),
-            },
-        )
-        fit = lmfit.minimize(
-            residuals,
-            params,
-            args=(model, self.data.x),
-            kws={"data": self.data.y, "err": self.data.err},
-        )
-        if not fit.success:
-            raise Exception
-
-        params0 = fit.params
-        A = params0["A"].value
-        y = params0["y"].value
-        w = params0["w"].value
-        d = params0["d"].value
-        B = params0["B"].value
-        xplot = gen_xplot(self.data.x.min(), self.data.x.max())
-        yplot = model(params0, xplot)
-
-        self.fit = struct("Fit",
-            params=varnames,
-            **{v: (fit.params[v].value, fit.params[v].stderr)
-                for v in varnames},
-            covar=fit.covar if hasattr(fit, "covar") else None,
-            decay=decay,
-            f0=lambda x: A * np.exp(z * y * x) * np.cos(w * x + d) + B,
-            f1=lambda x: (
-                A * (z * y) * np.exp(z * y * x) * np.cos(w * x + d)
-                - A * w * np.exp(z * y * x) * np.sin(w * x + d)
-            ),
-            f2=lambda x: (
-                A * y**2 * np.exp(z * y * x) * np.cos(w * x + d)
-                - A * w**2 * np.exp(z * y * x) * np.cos(w * x + d)
-                - 2 * A * w * (z * y) * np.exp(z * y * x) * np.sin(w * x + d)
-            ),
-            xplot=xplot,
-            yplot=yplot,
-        )
-        return self
-
-Fitter1D = Fitter
-
-class Fitter2D:
-    def __init__(X: np.ndarray, Y: np.ndarray, Z: np.ndarray,
-            err: np.ndarray=None):
-        self.data = Struct("Data",
-            X=X, Y=Y, Z=Z, err=np.ones(X.shape) if err is None else err)
-        self.fit = None
-
-        def clone(self) -> Self:
-            return Fitter2D(
-                self.data.X, self.data.Y, self.data.Z, self.data.err)
-
-    @staticmethod
-    def load_results(infile: pathlib.Path, label_pat: str, data_path: list[str],
-            indep_groups: (int, int),
-            group_filters: dict[int, type(lambda: bool)]=None,
-            skip_non_match: bool=True, print_skipped: bool=True):
-        [x, y], Z, err = load_results(
-            infile, label_pat, data_path, indep_groups, group_filters,
-            skip_non_match, print_skipped)
-        X, Y = np.meshgrid(x, y)
-        return Fitter2D(X, Y, Z, err)
-
-    def as_polynomial(self, deg_x: int=1, deg_y: int=1,
-            init_params: dict[str, float]=None,
-            param_bounds: dict[str, (float | None, float | None)]=None,
-            overwrite: bool=False):
-        assert self.fit is None or overwrite, "Data has already been fit"
-        assert deg_x >= 0
-        assert deg_y >= 0
-        deg_generator = product(range(deg_x + 1), range(deg_y + 1))
-        varnames = [
-            f"a{i}{j}" for i, j in product(range(deg_x + 1), range(deg_y + 1))]
-
-        def model(params: lmfit.Parameters, X: np.ndarray, Y: np.ndarray):
-            a = [
-                [params[i][j].value for j in range(deg_y)]
-                for i in range(deg_x)
-            ]
-            return sum(a[i][j] * X**i * Y**j for i, j in deg_generator)
-
-        params = gen_params(
-            varnames,
-            init_params,
-            {"a00": self.data.Z.mean()},
-            param_bounds,
-        )
-        fit = lmfit.minimize(
-            residuals,
-            params,
-            args=(model, self.data.X, self.data.Y),
-            kws={"data": self.data.Z, "err": self.data.err},
-        )
-        if not fit.success:
-            raise Exception
-
-        params0 = fit.params
-        xplot = gen_xplot(self.data.X.min(), self.data.X.max())
-        yplot = gen_xplot(self.data.Y.min(), self.data.Y.max())
-        Xplot, Yplot = np.meshgrid(xplot, yplot)
-        Zplot = model(params0, Xplot, Yplot)
-
-        self.fit = struct("Fit",
-            params=varnames,
-            **{v: (params0[v].value, params0[v].stderr)
-                for v in varnames},
-            covar=fit.covar if hasattr(fit, "covar") else None,
-            deg_x=deg_x,
-            deg_y=deg_y,
-            f0=lambda x, y: sum(
-                params0[f"a{i}{j}"].value * x**i * y**j
-                for i, j in product(range(deg_x + 1), range(deg_y + 1))
-            ),
-            f1=lambda x, y: np.array([
-                sum(
-                    i * params0[f"a{i}{j}"].value * x**(i - 1) * y**j
-                    for i, j in product(range(1, deg_x + 1), range(deg_y + 1))
-                ),
-                sum(
-                    j * params0[f"a{i}{j}"].value * x**i * y**(j - 1)
-                    for i, j in product(range(deg_x + 1), range(1, deg_y + 1))
-                ),
-            ]),
-            f2=lambda x, y: (
-                sum(
-                    i * (i - 1) * params0[f"a{i}{j}"].value * x**(i - 2) * y**j
-                    for i, j in product(range(2, deg_x + 1), range(deg_y + 1))
-                )
-                + sum(
-                    j * (j - 1) * params0[f"a{i}{j}"].value * x**i * y**(i - 2)
-                    for i, j in product(range(deg_x + 1), range(2, deg_y + 1))
-                )
-            ),
-            Xplot=Xplot,
-            Yplot=Yplot,
-            Zplot=Zplot,
-        )
-        return self
-
-    def as_gaussian(self, stdev_s: bool=False, fix_max: bool=False,
-            init_params: dict[str, float]=None,
-            param_bounds: dict[str, (float | None, float | None)]=None,
-            overwrite: bool=False):
-        assert self.fit is None or overwrite, "Data has already been fit"
-        varnames = ["A", "ux", "uy", "sx", "sy", "th", "B"]
-        z = 2 if stdev_s else 1
-
-        def model(params: lmfit.Parameters, X: np.ndarray, Y: np.ndarray):
-            A = params["Ax"].value
-            ux = params["ux"].value
-            uy = params["uy"].value
-            sx = params["sx"].value
-            sy = params["sy"].value
-            th = params["th"].value
-            Xrel = X - ux
-            Yrel = Y - uy
-            Xrot = np.cos(th) * Xrel + np.sin(th) * Yrel
-            Yrot = -np.sin(th) * Xrel + np.cos(th) * Yrel
-            return A * np.exp(-(Xrot / sx)**2 / z - (Yrot / sy)**2 / z) + B
-
-        if fix_max:
-            params = gen_params(
-                ["A", "sx", "sy", "th"],
-                init_params,
-                {
-                    "A": self.data.Z.max(),
-                    "sx": self.data.X.std(),
-                    "sy": self.data.Y.std(),
-                },
-                param_bounds,
-                {
-                    "sx": (0.0, None),
-                    "sy": (0.0, None),
-                    "th": (0.0, np.pi / 2.0),
-                },
-            )
-            params.add("A0", value=self.data.Z.max(), vary=False)
-            params.add("ux",
-                value=self.data.X[self.data.Z.argmax()], vary=False)
-            params.add("uy",
-                value=self.data.Y[self.data.Z.argmax()], vary=False)
-            params.add("B", expr="A0 - A")
-        else:
-            params = gen_params(
-                varnames,
-                init_params,
-                {
-                    "A": self.data.Z.max(),
-                    "ux": self.data.X[self.data.Z.argmax()],
-                    "sx": self.data.X.std(),
-                    "uy": self.data.Y[self.data.Z.argmax()],
-                    "sy": self.data.Y.std(),
-                    "B": self.data.Z.min(),
-                },
-                param_bounds,
-                {
-                    "sx": (0.0, None),
-                    "sy": (0.0, None),
-                    "th": (0.0, np.pi / 2.0),
-                },
-            )
-        fit = lmfit.minimize(
-            residuals,
-            params,
-            args=(model, self.data.X, self.data.Y),
-            kws={"data": self.data.Z, "err": self.data.err},
-        )
-        if not fit.success:
-            raise Exception
-
-        params0 = fit.params
-        A = params0["A"].value
-        ux = params0["ux"].value
-        uy = params0["uy"].value
-        sx = params0["sx"].value
-        sy = params0["sy"].value
-        th = params0["th"].value
-        B = params0["B"].value
-        xplot = gen_xplot(self.data.X.min(), self.data.X.max())
-        yplot = gen_xplot(self.data.Y.min(), self.data.Y.max())
-        Xplot, Yplot = np.meshgrid(xplot, yplot)
-        Zplot = model(params0, Xplot, Yplot)
-
-        xp = lambda x, y: np.cos(th) * (x - ux) + np.sin(th) * (y - uy)
-        yp = lambda x, y: -np.sin(th) * (x - ux) + np.cos(th) * (y - uy)
-
-        self.fit = struct("Fit",
-            params=varnames,
-            stdev_s=stdev_s,
-            fix_max=fix_max,
-            **{v: (params0[v].value, params0[v].stderr)
-                for v in varnames},
-            covar=fit.covar if hasattr(fit, "covar") else None,
-            f0=lambda x, y: (
-                A * np.exp(-(xp(x, y) / sx)**2 / z - (yp(x, y) / sy)**2 / z) + B
-            ),
-            f1=lambda x, y: np.array([
-                -2 * A * (
-                    + xp(x, y) / (z * sx**2) * np.cos(th)
-                    - yp(x, y) / (z * sy**2) * np.sin(th)
-                ) * np.exp(-(xp / sx)**2 / z - (yp / sy)**2 / z),
-                -2 * A * (
-                    + xp(x, y) / (z * sx**2) * np.sin(th)
-                    + yp(x, y) / (z * sy**2) * np.cos(th)
-                ) * np.exp(-(xp / sx)**2 / z - (yp / sy)**2 / z),
-            ]),
-            f2=lambda x, y: (
-                2 * A / z * (
-                    2 / z * ((xp(x, y) / sx**2)**2 + (yp(x, y) / sy**2)**2)
-                    - (1 / sx**2 + 1 / sy**2)
-                ) * np.exp(-(xp / sx)**2 / z - (yp / sy)**2 / z)
-            ),
-            Xplot=Xplot,
-            Yplot=Yplot,
-            Zplot=Zplot,
-        )
-        return self
-
-    def as_lorentzian(self, fix_max: bool=False,
-            init_params: dict[str, float]=None,
-            param_bounds: dict[str, (float | None, float | None)]=None,
-            overwrite: bool=False):
-        assert self.fit is None or overwrite, "Data has already been fit"
-        varnames = ["A", "ux", "uy", "sx", "sy", "th", "B"]
-
-        def model(params: lmfit.Parameters, X: np.ndarray, Y: np.ndarray):
-            A = params["Ax"].value
-            ux = params["ux"].value
-            uy = params["uy"].value
-            sx = params["sx"].value
-            sy = params["sy"].value
-            th = params["th"].value
-            Xrel = X - ux
-            Yrel = Y - uy
-            Xrot = np.cos(th) * Xrel + np.sin(th) * Yrel
-            Yrot = -np.sin(th) * Xrel + np.cos(th) * Yrel
-            return A / (1 + (xrot / sx)**2 + (yrot / sy)**2) + B
-
-        if fix_max:
-            params = gen_params(
-                ["A", "sx", "sy", "th"],
-                init_params,
-                {
-                    "A": self.data.Z.max(),
-                    "sx": self.data.X.std(),
-                    "sy": self.data.Y.std(),
-                },
-                param_bounds,
-                {
-                    "sx": (0.0, None),
-                    "sy": (0.0, None),
-                    "th": (0.0, np.pi / 2.0),
-                },
-            )
-            params.add("A0", value=self.data.Z.max(), vary=False)
-            params.add("ux",
-                value=self.data.X[self.data.Z.argmax()], vary=False)
-            params.add("uy",
-                value=self.data.Y[self.data.Z.argmax()], vary=False)
-            params.add("B", expr="A0 - A")
-        else:
-            params = gen_params(
-                varnames,
-                init_params,
-                {
-                    "A": self.data.Z.max(),
-                    "ux": self.data.X[self.data.Z.argmax()],
-                    "sx": self.data.X.std(),
-                    "uy": self.data.Y[self.data.Z.argmax()],
-                    "sy": self.data.Y.std(),
-                    "B": self.data.Z.min(),
-                },
-                param_bounds,
-                {
-                    "sx": (0.0, None),
-                    "sy": (0.0, None),
-                    "th": (0.0, np.pi / 2.0),
-                },
-            )
-        fit = lmfit.minimize(
-            residuals,
-            params,
-            args=(model, self.data.X, self.data.Y),
-            kws={"data": self.data.Z, "err": self.data.err},
-        )
-        if not fit.success:
-            raise Exception
-
-        params0 = fit.params
-        A = params0["A"].value
-        ux = params0["ux"].value
-        uy = params0["uy"].value
-        sx = params0["sx"].value
-        sy = params0["sy"].value
-        th = params0["th"].value
-        B = params0["B"].value
-        xplot = gen_xplot(self.data.X.min(), self.data.X.max())
-        yplot = gen_xplot(self.data.Y.min(), self.data.Y.max())
-        Xplot, Yplot = np.meshgrid(xplot, yplot)
-        Zplot = model(params0, Xplot, Yplot)
-
-        xp = lambda x, y: np.cos(th) * (x - ux) + np.sin(th) * (y - uy)
-        yp = lambda x, y: -np.sin(th) * (x - ux) + np.cos(th) * (y - uy)
-
-        self.fit = struct("Fit",
-            params=varnames,
-            fix_max=fix_max,
-            **{v: (params0[v].value, params0[v].stderr)
-                for v in varnames},
-            covar=fit.covar if hasattr(fit, "covar") else None,
-            f0=lambda x, y: (
-                A / (1 + (xp(x, y) / sx)**2 + (yp(x, y) / sy)**2) + B
-            ),
-            f1=lambda x, y: np.array([
-                -2 * A * (
-                    + xp(x, y) / sx**2 * np.cos(th)
-                    - yp(x, y) / sy**2 * np.sin(th)
-                ) / (1 + (xp(x, y) / sx)**2 + (yp(x, y) / sy)**2)**2,
-                -2 * A * (
-                    + xp(x, y) / sx**2 * np.sin(th)
-                    + yp(x, y) / sy**2 * np.cos(th)
-                ) / (1 + (xp(x, y) / sx)**2 + (yp(x, y) / sy)**2)**2,
-            ]),
-            f2=lambda x, y: (
-                2 * A * (
-                    8 * ((xp(x, y) / sx**2)**2 + (yp(x, y) / sy**2)**2)
-                        / (1 + (xp(x, y) / sx)**2 + (yp(x, y) / sy)**2)
-                    - (1 / sx**2 + 1 / sy**2)
-                ) / (1 + (xp(x, y) / sx)**2 + (yp(x, y) / sy)**2)**2
-            ),
-            Xplot=Xplot,
-            Yplot=Yplot,
-            Zplot=Zplot,
-        )
-        return self
+            return self.model.f(self.fit_result.params, x)
 
