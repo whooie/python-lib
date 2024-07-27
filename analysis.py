@@ -141,13 +141,15 @@ class ExpVal:
             raise Exception("malformed input")
         return ExpVal(val, err)
 
-    @staticmethod
-    def from_lmfit_param(params: lmfit.Parameters, key: str):
-        return ExpVal(params[key].value, params[key].stderr)
+    def as_list(self) -> list[float]:
+        return [self.val, self.err]
+
+    def as_bounds(self) -> list[float]:
+        return [self.val - self.err, self.val + self.err]
 
     def __init__(self, val: float, err: float):
-        self.val = val
-        self.err = abs(err) if err is not None else np.nan
+        self.val = float(val)
+        self.err = abs(float(err)) if err is not None else np.nan
 
     def __eq__(self, rhs: Self | float | int) -> bool:
         other = ExpVal.from_num_or(rhs)

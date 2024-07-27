@@ -33,6 +33,7 @@ rcdefs = {
     "font.size"             : 8.0,
     "grid.color"            : "#d8d8d8",
     "grid.linewidth"        : 0.5,
+    "hatch.linewidth"       : 0.65,
     "image.cmap"            : "jet",
     "image.composite_image" : False,
     "legend.borderaxespad"  : 0.25,
@@ -62,15 +63,15 @@ for key in rcdefs:
     pp.rcParams[key] = rcdefs[key]
 
 hot_cold \
-    = cm.LinearSegmentedColormap.from_list("hot-cold", color_scales["hot_cold"])
+    = cm.LinearSegmentedColormap.from_list("hot-cold", color_scales["hot-cold"])
 fire_ice \
-    = cm.LinearSegmentedColormap.from_list("fire-ice", color_scales["fire_ice"])
+    = cm.LinearSegmentedColormap.from_list("fire-ice", color_scales["fire-ice"])
 powerade \
     = cm.LinearSegmentedColormap.from_list("powerade", color_scales["powerade"])
 floral \
     = cm.LinearSegmentedColormap.from_list("floral", color_scales["floral"])
-plasma \
-    = cm.LinearSegmentedColormap.from_list("plasma", color_scales["plasma"])
+blue_hot \
+    = cm.LinearSegmentedColormap.from_list("blue-hot", color_scales["blue-hot"])
 cyborg \
     = cm.LinearSegmentedColormap.from_list("cyborg", color_scales["cyborg"])
 sport \
@@ -89,7 +90,7 @@ colormaps = {
     "fire-ice"  : fire_ice,
     "powerade"  : powerade,
     "floral"    : floral,
-    "plasma"    : plasma,
+    "blue-hot"  : blue_hot,
     "cyborg"    : cyborg,
     "sport"     : sport,
     "vibrant"   : vibrant,
@@ -97,6 +98,8 @@ colormaps = {
     "pix"       : pix,
     "sunset"    : sunset,
 }
+for cmap in colormaps.values():
+    mpl.colormaps.register(cmap)
 
 def figure3D(*fig_args, **fig_kwargs):
     fig = pp.figure(*fig_args, **fig_kwargs)
@@ -622,7 +625,7 @@ class Plotter:
         return self._process_call(self.ax.set_yticks, args, kwargs)
 
     def set_cticks(self, *args, **kwargs):
-        return self._process_call(self.cbar.set_cticks, args, kwargs)
+        return self._process_call(self.cbar.set_ticks, args, kwargs)
 
     def set_xticklabels(self, *args, **kwargs):
         return self._process_call(self.ax.set_xticklabels, args, kwargs)
@@ -631,7 +634,7 @@ class Plotter:
         return self._process_call(self.ax.set_yticklabels, args, kwargs)
 
     def set_cticklabels(self, *args, **kwargs):
-        return self._process_call(self.cbar.set_cticklabels, args, kwargs)
+        return self._process_call(self.cbar.set_ticklabels, args, kwargs)
 
     def tick_params(self, *args, **kwargs):
         return self._process_call(self.ax.tick_params, args, kwargs)
